@@ -8,6 +8,7 @@ using ProgressBars
 using Plots
 using SparseArrays
 using LogExpFunctions
+using Roots
 
 ##############################
 
@@ -35,10 +36,12 @@ export simnngp
 
 include("geoloc.jl")
 export geolocate
+export geolocate2
 
 #########################
 
 include("misc.jl")
 export gammashaperate
+export logitmeansd
 
 end
