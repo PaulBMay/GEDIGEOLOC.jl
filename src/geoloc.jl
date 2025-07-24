@@ -130,7 +130,7 @@ function geolocate(y, loc, grid, reference, priors, initial, nsamps; numnb = 1, 
         lprior = logpdf(ϕpriordist, ϕ) + logpdf(ρpriordist, theta[1])
         lpriorprop = logpdf(ϕpriordist, ϕprop) + logpdf(ρpriordist, thetaprop[1])
 
-        acceptprob = exp(llprop + lpriorprop + sum(thetaprop) - ll - lprior - sum(theta))
+        acceptprob = exp(llprop + lpriorprop + thetaprop[2] - ll - lprior - thetaprop[1])
 
         if rand() < acceptprob
             ρ, ϕ = ρprop, ϕprop
