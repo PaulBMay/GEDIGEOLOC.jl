@@ -809,6 +809,6 @@ function geolocate_gfe(y, loc, grid, reference, priors, initial, nsamps; numnb =
 
     end
 
-    return (h = hsamps, α = αsamps, τ = τsamps, z = zsamps, Σ = Σsamps, μ = μsamps, w = wsamps, ρ = ρsamps, ϕ = ϕsamps)
+    return (h = hsamps, α = αsamps, τ = τsamps, z = zsamps, Σ = Σsamps, μ = μsamps, w = wsamps, ρ = ρsamps, ϕ = ϕsamps, πz = πzsamps)
 
 end
