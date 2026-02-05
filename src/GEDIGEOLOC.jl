@@ -37,11 +37,13 @@ export simnngp
 include("geoloc.jl")
 export geolocate
 export geolocate2
+export geolocate_gfe
 
 #########################
 
 include("misc.jl")
 export gammashaperate
+export betaparams
 export logitmeansd
 
 end
