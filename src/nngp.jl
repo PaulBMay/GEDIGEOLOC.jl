@@ -156,3 +156,67 @@ end
 function Base.copy(nngp::NNGP)
     return NNGP(copy(nngp.B), copy(nngp.F), copy(nngp.Border))
 end
+
+# ---------------------------
+
+function predneighbors(locp::AbstractVector, loc::AbstractVector)
+
+    np = length(locp)
+
+    nb = Matrix{Int}(undef, np, 2)
+
+    for i in 1:np
+
+        j = searchsortedlast(loc, locp[i])
+
+        nb[i,:] .= [j, j+1]
+
+    end
+
+    return nb
+
+end
+
+function getnngppred(nb, locp::AbstractMatrix, loc::AbstractMatrix, ϕ)
+
+    np = size(locp,1)
+    n = size(loc, 1)
+
+    Bnnz = 2*np
+    Bnzval = zeros(Bnnz)
+    Bnzrow = repeat(1:np, inner = 2)
+    Bnzcol = zeros(Int, Bnnz)
+
+    F = zeros(np)
+
+    rho = zeros(2,2)
+    k = zeros(2)
+
+    @views for i in 1:np
+
+        indi = nb[i,:]
+        rho .= expcor(loc[indi,:], ϕ)
+        k .= expcor(loc[indi,:], locp[i:i,:], ϕ)
+
+        cholesky!(rho) 
+
+        ldiv!(UpperTriangular(rho)', k)
+
+        F[i] = 1.0 - sum(abs2, k)
+
+        ldiv!(UpperTriangular(rho), k)
+
+        Bind = 2*(i-1) + 1
+        Bnzval[Bind:(Bind+1)] .= k
+        Bnzcol[Bind:(Bind+1)] .= indi
+
+    end
+
+    B = sparse(Bnzrow, Bnzcol, Bnzval, np, n)
+
+    return B, F
+    
+    
+
+end
+

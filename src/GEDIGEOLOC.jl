@@ -2,6 +2,7 @@ module GEDIGEOLOC
 
 using LinearAlgebra
 using Distances
+using NearestNeighbors
 using Random
 using Distributions
 using ProgressBars
@@ -45,5 +46,10 @@ include("misc.jl")
 export gammashaperate
 export betaparams
 export logitmeansd
+
+#########################
+
+include("geoloc_pred.jl")
+export predoffsets
 
 end
