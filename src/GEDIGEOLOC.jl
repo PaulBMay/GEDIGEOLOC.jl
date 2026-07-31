@@ -1,55 +1,43 @@
+"""
+    GEDIGEOLOC
+
+Bayesian inference for GEDI geolocation offsets within a contiguous beam
+collection.
+
+Each footprint's offset is drawn from a grid of candidates, scored against a
+grid of reference (DEM) values, under a continuous-lag AR(1) prior along track.
+See [`geolocate`](@ref).
+"""
 module GEDIGEOLOC
 
 using LinearAlgebra
-using Distances
-using NearestNeighbors
 using Random
 using Distributions
-using ProgressBars
-using Plots
-using SparseArrays
+using Distances
 using LogExpFunctions
+using ProgressBars
 using Roots
-
-##############################
-
-struct NNGP
-    B::SparseMatrixCSC{Float64}
-    F::Vector{Float64}
-    Border::Vector{Int}
-end
-
-export NNGP
-
-################################
 
 include("covariances.jl")
 
-#############################
+include("ar1.jl")
+export AR1
 
-include("nngp.jl")
-export getnngp
-export getnngp!
-export formprec
-export simnngp
+include("grid.jl")
+export OffsetGrid, nearestindex, centerindex, islattice
 
-#######################
+include("offsets.jl")
 
 include("geoloc.jl")
-export geolocate
-export geolocate2
-export geolocate_gfe
+export geolocate, offsets, posteriormean
 
-#########################
+include("predict.jl")
+export predoffsets
 
 include("misc.jl")
-export gammashaperate
-export betaparams
-export logitmeansd
+export gammashaperate, betaparams, logitmeansd
 
-#########################
-
-include("geoloc_pred.jl")
-export predoffsets
+include("deprecated.jl")
+export geolocate2, geolocate_gfe
 
 end

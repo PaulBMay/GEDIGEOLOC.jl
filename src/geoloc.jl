@@ -1,814 +1,508 @@
-function geolocate(y, loc, grid, reference, priors, initial, nsamps; numnb = 1, propvar = 1e-4)
+# ---------------------------------------------------------------------------
+# Scalar / small-block Gibbs components.
+#
+# These are plain top-level functions rather than closures over the sampler's
+# locals: they compile once, stay type stable, and show up under their own names
+# in a profile.
+# ---------------------------------------------------------------------------
 
+"""
+    sample_alpha(y, curref, τobs, prior, rng)
 
-    #######################
-    # Helper funcs
-    #######################
-
-
-    function llρϕ(res, Qpostchol, nngp, Σ, ρ)
-
-        n,p = size(res)
-    
-        Σc = cholesky(Σ)
-    
-        resS = ( (1/(1-ρ))*res - (1/(1-ρ)^2) * (Qpostchol \ res) ) / Σc
-    
-        sse = vec(res)'*vec(resS)
-    
-        ldet = n*logdet(Σc) + p*( logdet(Qpostchol) + sum(log.(nngp.F)) + n*log(ρ) + n*log(1-ρ) )
-    
-        ll = -0.5*(ldet + sse)
-    
-        return ll
-    
+`α | ·` with a `N(mean, 1/precision)` prior, `prior = (mean, precision)`.
+Heteroscedastic in `τobs`, so it covers the mixture error model too.
+"""
+function sample_alpha(y, curref, τobs, prior, rng::AbstractRNG)
+    prec = Float64(prior[2])
+    num = Float64(prior[2]) * Float64(prior[1])
+    @inbounds @simd for i in eachindex(y)
+        prec += τobs[i]
+        num += τobs[i] * (y[i] - curref[i])
     end
-
-    function logit(x::Number)
-        return log(x) - log(1-x)
-    end
-
-    function softmax(x::Number)
-        return 1/(1+exp(-x))
-    end
-
-    ######################
-    # Gibbs components
-    ######################
-
-    function sample_h!(h, loglike, meanu, gridu, grid, y, curref, α, reference, τ, μ, w, ρ, Σ)
-
-        n = size(h,1)
-        
-        logprior = zeros(size(reference,1))
-        logprob = zeros(size(reference, 1))
-        prob = zeros(size(reference, 1))
-
-        loglike .= @. -0.5*τ*(reference + α - y')^2
-
-        covchol = cholesky((1-ρ)*Σ)
-
-        gridu .= grid / covchol.U
-        meanu .= (w .+ μ') / covchol.U
-
-
-        @inline @fastmath for i in 1:n
-
-            meanui = view(meanu, i, :)
-            logprior .= -0.5*vec(sum( (gridu .-  meanui').^2, dims = 2))
-            loglikei = view(loglike, :, i)
-            logprob .= loglikei + logprior
-            softmax!(prob, logprob)
-            hind = rand(Categorical(prob))
-            h[i,:] .= grid[hind,:]
-            curref[i] = reference[hind, i]
-
-        end
-
-        return nothing
-
-    end
-
-    function sample_α(y, curref, τ, priors)
-        postprec = priors.α[2] + length(y)*τ
-        postmu = (τ*sum(y - curref) + priors.α[2]*priors.α[1])/postprec
-        return postmu + sqrt(1/postprec)*randn()
-    end
-
-    function sample_τ(y, α, curref, priors)
-        shape = priors.τ[1] + length(y)/2
-        rate = priors.τ[2] + sum((y .- α .- curref).^2)/2
-        return rand(Gamma(shape, 1/rate))
-    end
-
-    function sample_Σ(h, μ, ρ, Qpostchol, priors)
-        res = h .- μ'
-        resS = (1/(1-ρ))*res - (1/(1-ρ))^2 * (Qpostchol \ res)
-        SSE = res' * resS
-        freedom = priors.Σ[1] + size(h,1)
-        scale = Distributions.PDMats.PDMat(Symmetric(priors.Σ[1]*priors.Σ[2] + SSE)) 
-        return rand(InverseWishart(freedom, scale))
-    end
-
-    function sample_μ(h, Qpostchol, ρ, Σ)
-        n = size(h,1)
-        oneSolve = (1/(1-ρ))*ones(n) - (1/(1-ρ))^2 * (Qpostchol \ ones(n))
-        scale = 1/sum(oneSolve)
-        μmu = vec(scale*(oneSolve'*h))
-        return rand(MvNormal(μmu, Symmetric(scale*Σ)))
-    end
-
-    function sample_w!(w, h, μ, ρ, Σ, Qpostchol)   
-        ΣU = cholesky(Σ).U
-        resu = ( (h .- μ') ./ (1- ρ) ) / ΣU
-        wmu = Qpostchol \ resu
-        werror = view(Qpostchol.U \ randn(size(w)), Qpostchol.p, :)
-        w .= (wmu + werror) * ΣU
-    end
-
-    function sample_ρϕ!(nngp, nngpprop, Qpostchol, Qpostpropchol, numnb, loc, ρ, ϕ, h, μ, Σ, propvarc, priors)
-
-        theta = [logit(ρ), log(ϕ)]
-
-        thetaprop = theta + propvarc.L*randn(2)
-
-        ρprop = softmax(thetaprop[1])
-        ϕprop = exp(thetaprop[2])
-
-        getnngp!(nngpprop, loc, ϕprop, numnb)
-
-        Qpostprop = (1/ρprop)*formprec(nngpprop) + (1/(1-ρprop))*I(size(loc,1))
-        cholesky!(Qpostpropchol, Qpostprop)
-
-        res = h .- μ'
-
-        ll = llρϕ(res, Qpostchol, nngp, Σ, ρ)
-        llprop = llρϕ(res, Qpostpropchol, nngpprop, Σ, ρprop)
-
-        ϕpriordist = Gamma(priors.ϕ[1], 1/priors.ϕ[2])
-        ρpriordist = Normal(priors.ρ[1], priors.ρ[2])
-        lprior = logpdf(ϕpriordist, ϕ) + logpdf(ρpriordist, theta[1])
-        lpriorprop = logpdf(ϕpriordist, ϕprop) + logpdf(ρpriordist, thetaprop[1])
-
-        acceptprob = exp(llprop + lpriorprop + thetaprop[2] - ll - lprior - theta[2])
-
-        if rand() < acceptprob
-            ρ, ϕ = ρprop, ϕprop
-            Qpostchol = copy(Qpostpropchol)
-            nngp.B.nzval .= nngpprop.B.nzval
-            nngp.F .= nngpprop.F
-        end
-
-        return ρ, ϕ, Qpostchol
-
-    end
-    
-
-    ##########################
-
-
-
-    n = length(y)
-    k = size(grid,1)
-
-    # Open up sample memory and get initial values
-
-    hsamps = zeros(n, 2, nsamps)
-    h = zeros(n,2)
-
-    wsamps = zeros(n, 2, nsamps)
-    w = initial.w
-    wsamps[:,:,1] = initial.w
-
-    Σsamps = zeros(2, 2, nsamps)
-    Σ = initial.Σ
-    Σsamps[:,:,1] = Σ
-
-    ρsamps = zeros(nsamps)
-    ρ = initial.ρ
-    ρsamps[1] = ρ
-
-    ϕsamps = zeros(nsamps)
-    ϕ = initial.ϕ
-    ϕsamps[1] = ϕ
-
-    μsamps = zeros(2, nsamps)
-    μ = initial.μ
-    μsamps[:,1] = μ
-
-    αsamps = zeros(nsamps)
-    α = initial.α
-    αsamps[1] = α
-
-    τsamps = zeros(nsamps)
-    τ = initial.τ
-    τsamps[1] = τ
-
-    gridcenterind = argmin(sum(grid.^2, dims = 2)[:,1])
-    curref = reference[CartesianIndex.(fill(gridcenterind, n), 1:n)]
-
-    # Initialize important mats and decomps
-
-    nngp = getnngp(loc, ϕ, numnb)
-    nngpprop = copy(nngp)
-    Qpost = (1/ρ)*formprec(nngp) + (1/(1-ρ))*I(n)
-    Qpostchol = cholesky(Qpost)
-    Qpostpropchol = copy(Qpostchol)
-
-    if size(propvar,1) == 1
-        propvar = propvar*I(2)
-    end
-
-    propvarc = cholesky(Symmetric(propvar))
-
-    gridu = copy(grid)
-    meanu = copy(w)
-    loglike = copy(reference)
-
-    ##########################################
-    # Begin sampling
-    ##########################################
-
-    iter = ProgressBar(1:nsamps)
-
-    for m in iter
-
-        sample_h!(h, loglike, meanu, gridu, grid, y, curref, α, reference, τ, μ, w, ρ, Σ)
-
-        α = sample_α(y, curref, τ, priors)
-
-        τ = sample_τ(y, α, curref, priors)
-
-        Σ = sample_Σ(h, μ, ρ, Qpostchol, priors)
-
-        μ = sample_μ(h, Qpostchol, ρ, Σ)
-
-        sample_w!(w, h, μ, ρ, Σ, Qpostchol)
-
-        ρ, ϕ, Qpostchol = sample_ρϕ!(nngp, nngpprop, Qpostchol, Qpostpropchol, numnb, loc, ρ, ϕ, h, μ, Σ, propvarc, priors)
-
-        ######
-
-        hsamps[:,:,m] .= h
-        αsamps[m] = α
-        τsamps[m] = τ
-        Σsamps[:,:,m] .= Σ
-        μsamps[:,m] .= μ
-        wsamps[:,:,m] .= w
-        ρsamps[m] = ρ
-        ϕsamps[m] = ϕ
-
-
-    end
-
-    return (h = hsamps, α = αsamps, τ = τsamps, Σ = Σsamps, μ = μsamps, w = wsamps, ρ = ρsamps, ϕ = ϕsamps)
-
+    return num / prec + randn(rng) / sqrt(prec)
 end
 
+"""
+    sample_tau(y, α, curref, prior, rng)
 
-function geolocate2(y, time, grid, reference, priors, initial, nsamps; propsd = 1e-2, fixϕ = false, fixall = false)
-
-
-    #######################
-    # Helper funcs
-    #######################
-
-    function formQar1(ρ::Vector{Float64})
-
-        n = length(ρ) + 1
-        ρsq = @. ρ^2
-        scale = @. 1 / (1 - ρsq)
-
-        d = similar(scale, n)
-        d[1] = scale[1]
-        @inbounds for i in 2:n-1
-            d[i] = scale[i-1] + scale[i] * ρsq[i]
-        end
-        d[n] = scale[n-1]
-
-        e = @. -scale * ρ
-
-        return SymTridiagonal(d, e)
+Single-component observation precision, `prior = (shape, rate)`.
+"""
+function sample_tau(y, α, curref, prior, rng::AbstractRNG)
+    sse = 0.0
+    @inbounds @simd for i in eachindex(y)
+        r = y[i] - α - curref[i]
+        sse += r * r
     end
-
-    function formQar1!(Q::SymTridiagonal, ρ::Vector{Float64})
-
-        n = length(ρ) + 1
-        ρsq = @. ρ^2
-        scale = @. 1 / (1 - ρsq)
-
-        Q.dv[1] = scale[1]
-        @inbounds for i in 2:n-1
-            Q.dv[i] = scale[i-1] + scale[i] * ρsq[i]
-        end
-        Q.dv[n] = scale[n-1]
-
-        Q.ev .= @. -scale * ρ
-
-        return nothing
-
-    end
-    
-    function llϕ(res, Q, Σ)
-
-        n,p = size(res)
-    
-        Σc = cholesky(Σ)
-    
-        resS = ( Q * res ) / Σc
-    
-        sse = vec(res)'*vec(resS)
-    
-        ldet = n*logdet(Σc) - p*logdet(Q)
-    
-        ll = -0.5*(ldet + sse)
-    
-        return ll
-    
-    end
-
-
-    ######################
-    # Gibbs components
-    ######################
-
-    function sample_h!(h, curref, loglike, gridu, reference, grid, y, α, τ, μ, Σ, Q)
-
-        n = size(h,1)
-        
-        loglike .= @. -0.5*τ*(reference + α - y')^2
-
-        Σchol = cholesky(Σ)
-
-        gridu .= grid / Σchol.U
-
-        # Sample first footprint
-
-        w_next = h[2,:] - μ
-        w_prev = similar(w_next) # No previous, yet
-
-        meanu_i = Σchol.L \ (μ - ( Q.ev[1]*w_next ) ./ Q.dv[1] )
-
-        logprior = -0.5*vec(sum( (gridu .-  meanu_i').^2, dims = 2)) .* Q.dv[1]
-        logprob = view(loglike, :, 1) + logprior
-        prob = softmax(logprob)
-        hind = rand(Categorical(prob))
-        h[1,:] = grid[hind,:]
-        curref[1] = reference[hind, 1]
-
-        # Sample footprints 2:n
-
-        @inline @fastmath for i in 2:(n-1)
-
-            w_next .= h[i+1,:] - μ
-            w_prev .= h[i-1,:] - μ
-            meanu_i .= Σchol.L \ (μ - ( Q.ev[i]*w_next + Q.ev[i-1]*w_prev) ./ Q.dv[i] )
-            logprior .= -0.5*vec(sum( (gridu .-  meanu_i').^2, dims = 2)) .* Q.dv[i]
-            logprob .= view(loglike, :, i) + logprior
-            softmax!(prob, logprob)
-            hind = rand(Categorical(prob))
-            h[i,:] .= grid[hind,:]
-            curref[i] = reference[hind, i]
-
-        end
-
-        # Sample last footprint
-
-        w_prev .= h[n-1,:] - μ
-        meanu_i .= Σchol.L \ (μ - (Q.ev[n-1]*w_prev) ./ Q.dv[n] )
-        logprior .= -0.5*vec(sum( (gridu .-  meanu_i').^2, dims = 2)) .* Q.dv[n]
-        logprob .= view(loglike, :, n) + logprior
-        softmax!(prob, logprob)
-        hind = rand(Categorical(prob))
-        h[n,:] .= grid[hind,:]
-        curref[n] = reference[hind, n]
-
-        return nothing
-
-    end
-
-    function sample_α(y, curref, τ, priors)
-        postprec = priors.α[2] + length(y)*τ
-        postmu = (τ*sum(y - curref) + priors.α[2]*priors.α[1])/postprec
-        return postmu + sqrt(1/postprec)*randn()
-    end
-
-    function sample_τ(y, α, curref, priors)
-        shape = priors.τ[1] + length(y)/2
-        rate = priors.τ[2] + sum((y .- α .- curref).^2)/2
-        return rand(Gamma(shape, 1/rate))
-    end
-
-    function sample_Σ(h, μ, Q, priors)
-        res = h .- μ'
-        resS = Q * res
-        SSE = res' * resS
-        freedom = priors.Σ[1] + size(h,1)
-        scale = Distributions.PDMats.PDMat(Symmetric(priors.Σ[1]*priors.Σ[2] + SSE)) 
-        return rand(InverseWishart(freedom, scale))
-    end
-
-    function sample_μ(h, Q, Σ)
-        n = size(h,1)
-        oneSolve = Q * ones(n)
-        scale = 1/sum(oneSolve)
-        μmu = vec(scale*(oneSolve'*h))
-        return rand(MvNormal(μmu, Symmetric(scale*Σ)))
-    end
-
-    function sample_ϕ!(ρ, ρprop, Q, Qprop, lags, ϕ, h, μ, Σ, propsd, priors)
-
-        res = h .- μ'
-
-        logϕ = log(ϕ)
-        logϕprop = logϕ + propsd*randn()
-        ϕprop = exp(logϕprop)
-
-        ρprop .= @. exp(-lags / ϕprop)
-        formQar1!(Qprop, ρprop) 
-
-        ll = llϕ(res, Q, Σ)
-        llprop = llϕ(res, Qprop, Σ)
-
-        ϕpriordist = Gamma(priors.ϕ[1], 1/priors.ϕ[2])
-        lprior = logpdf(ϕpriordist, ϕ)
-        lpriorprop = logpdf(ϕpriordist, ϕprop)
-
-        acceptprob = exp(llprop + lpriorprop + logϕprop - ll - lprior - logϕ)
-
-        if rand() < acceptprob
-            ϕ = ϕprop
-            Q.dv .= Qprop.dv
-            Q.ev .= Qprop.ev
-            ρ .= ρprop
-        end
-
-        return ϕ
-
-    end
-    
-
-    ##########################
-
-
-
-    n = length(y)
-
-    # Open up sample memory and get initial values
-
-    hsamps = zeros(n, 2, nsamps)
-    h = initial.h
-    hsamps[:,:,1] = h
-
-    Σsamps = zeros(2, 2, nsamps)
-    Σ = initial.Σ
-    Σsamps[:,:,1] = Σ
-
-    ϕsamps = zeros(nsamps)
-    ϕ = initial.ϕ
-    ϕsamps[1] = ϕ
-
-    μsamps = zeros(2, nsamps)
-    μ = initial.μ
-    μsamps[:,1] = μ
-
-    αsamps = zeros(nsamps)
-    α = initial.α
-    αsamps[1] = α
-
-    τsamps = zeros(nsamps)
-    τ = initial.τ
-    τsamps[1] = τ
-
-    gridcenterind = argmin(sum(grid.^2, dims = 2)[:,1])
-    curref = reference[CartesianIndex.(fill(gridcenterind, n), 1:n)]
-
-    # Initialize important mats and decomps
-
-    lags = time[2:n] - time[1:(n-1)]
-    ρ = @. exp(-lags / ϕ)
-    ρprop = similar(ρ)
-    Q = formQar1(ρ)
-    Qprop = similar(Q)
-
-    loglike = similar(reference)
-    gridu = similar(grid)
-
-    ##########################################
-    # Begin sampling
-    ##########################################
-
-    iter = ProgressBar(1:nsamps)
-
-    for m in iter
-
-        sample_h!(h, curref, loglike, gridu, reference, grid, y, α, τ, μ, Σ, Q)
-
-        if !fixall
-        α = sample_α(y, curref, τ, priors)
-
-        τ = sample_τ(y, α, curref, priors)
-
-        Σ = sample_Σ(h, μ, Q, priors)
-
-        μ = sample_μ(h, Q, Σ)
-
-        if !fixϕ ϕ = sample_ϕ!(ρ, ρprop, Q, Qprop, lags, ϕ, h, μ, Σ, propsd, priors) end
-
-        end
-
-        ######
-
-        hsamps[:,:,m] .= h
-        αsamps[m] = α
-        τsamps[m] = τ
-        Σsamps[:,:,m] .= Σ
-        μsamps[:,m] .= μ
-        ϕsamps[m] = ϕ
-
-
-    end
-
-    return (h = hsamps, α = αsamps, τ = τsamps, Σ = Σsamps, μ = μsamps, ϕ = ϕsamps)
-
+    return rand(rng, Gamma(prior[1] + length(y) / 2, 1 / (prior[2] + sse / 2)))
 end
 
-function geolocate_gfe(y, loc, grid, reference, priors, initial, nsamps; numnb = 1, propvar = 1e-4)
+"""
+    sample_tau_mixture!(τ, y, α, curref, z, prior0, prior1, rng)
 
-
-    #######################
-    # Helper funcs
-    #######################
-
-
-    function llρϕ(res, Qpostchol, nngp, Σ, ρ)
-
-        n,p = size(res)
-    
-        Σc = cholesky(Σ)
-    
-        resS = ( (1/(1-ρ))*res - (1/(1-ρ)^2) * (Qpostchol \ res) ) / Σc
-    
-        sse = vec(res)'*vec(resS)
-    
-        ldet = n*logdet(Σc) + p*( logdet(Qpostchol) + sum(log.(nngp.F)) + n*log(ρ) + n*log(1-ρ) )
-    
-        ll = -0.5*(ldet + sse)
-    
-        return ll
-    
-    end
-
-    function logit(x::Number)
-        return log(x) - log(1-x)
-    end
-
-    function softmax(x::Number)
-        return 1/(1+exp(-x))
-    end
-
-    ######################
-    # Gibbs components
-    ######################
-
-    function sample_h!(h, loglike, meanu, gridu, grid, y, curref, α, reference, τ, z, μ, w, ρ, Σ)
-
-        n = size(h,1)
-        
-        logprior = zeros(size(reference,1))
-        logprob = zeros(size(reference, 1))
-        prob = zeros(size(reference, 1))
-
-        loglike .= @. -0.5 * τ[z+1]' * (reference + α - y')^2
-
-        covchol = cholesky((1-ρ)*Σ)
-
-        gridu .= grid / covchol.U
-        meanu .= (w .+ μ') / covchol.U
-
-
-        @inline @fastmath for i in 1:n
-
-            meanui = view(meanu, i, :)
-            logprior .= -0.5*vec(sum( (gridu .-  meanui').^2, dims = 2))
-            loglikei = view(loglike, :, i)
-            logprob .= loglikei + logprior
-            softmax!(prob, logprob)
-            hind = rand(Categorical(prob))
-            h[i,:] .= grid[hind,:]
-            curref[i] = reference[hind, i]
-
+Two-component observation precision for the ground-finding-error model:
+`z[i] = false` is the well-behaved component, `z[i] = true` the inflated one.
+"""
+function sample_tau_mixture!(τ, y, α, curref, z, prior0, prior1, rng::AbstractRNG)
+    n1 = 0
+    sse0 = sse1 = 0.0
+    @inbounds for i in eachindex(y)
+        r = y[i] - α - curref[i]
+        if z[i]
+            n1 += 1
+            sse1 += r * r
+        else
+            sse0 += r * r
         end
+    end
+    n0 = length(y) - n1
+    τ[1] = rand(rng, Gamma(prior0[1] + n0 / 2, 1 / (prior0[2] + sse0 / 2)))
+    τ[2] = rand(rng, Gamma(prior1[1] + n1 / 2, 1 / (prior1[2] + sse1 / 2)))
+    return τ
+end
 
-        return nothing
+"""
+    sample_z!(z, y, α, curref, τ, πz, rng)
 
+Mixture indicators.  Written as a single logistic of the log-odds, which is
+stable without an explicit max-subtraction.
+"""
+function sample_z!(z, y, α, curref, τ, πz, rng::AbstractRNG)
+    b = log(πz) - log1p(-πz) + 0.5 * (log(τ[2]) - log(τ[1]))
+    dτ = 0.5 * (τ[1] - τ[2])
+    @inbounds for i in eachindex(y)
+        r = y[i] - α - curref[i]
+        z[i] = rand(rng) < logistic(muladd(dτ, r * r, b))
+    end
+    return z
+end
+
+"""
+    sample_pi(z, prior, rng)
+
+Mixture weight with a `Beta(prior[1], prior[2])` prior.
+"""
+function sample_pi(z, prior, rng::AbstractRNG)
+    s = count(z)
+    return rand(rng, Beta(prior[1] + s, prior[2] + length(z) - s))
+end
+
+"""
+    sample_Sigma(ar, res, CinvRes, prior, rng)
+
+`Σ | ·` with an `InverseWishart(ν₀, ν₀Ψ)` prior, `prior = (ν₀, Ψ)`.  `w` is
+integrated out via `C⁻¹`.
+"""
+function sample_Sigma(ar::AR1, res, CinvRes, prior, rng::AbstractRNG)
+    m11, m12, m22 = crossprod!(ar, res, CinvRes)
+    ν0 = Float64(prior[1])
+    Ψ = ν0 .* prior[2]
+    scale = Symmetric([Ψ[1, 1]+m11 Ψ[1, 2]+m12; Ψ[2, 1]+m12 Ψ[2, 2]+m22])
+    return rand(rng, InverseWishart(ν0 + size(res, 1), Distributions.PDMats.PDMat(scale)))
+end
+
+"""
+    sample_mu!(μ, h, ar, Σ, rng)
+
+`μ | ·` under a flat prior: `N((1ᵀC⁻¹1)⁻¹1ᵀC⁻¹h, (1ᵀC⁻¹1)⁻¹Σ)`.  `C⁻¹1` is
+cached on `ar` and only changes when `(ϕ, ρ)` do.
+"""
+function sample_mu!(μ, h, ar::AR1, Σ, rng::AbstractRNG)
+    s = 1 / ar.onesum
+    o = ar.onesolve
+    m1 = s * dot(o, view(h, :, 1))
+    m2 = s * dot(o, view(h, :, 2))
+    l11 = sqrt(s * Σ[1, 1])
+    l21 = s * Σ[2, 1] / l11
+    l22 = sqrt(max(s * Σ[2, 2] - l21 * l21, 0.0))
+    z1, z2 = randn(rng), randn(rng)
+    μ[1] = m1 + l11 * z1
+    μ[2] = m2 + l21 * z1 + l22 * z2
+    return μ
+end
+
+# ---------------------------------------------------------------------------
+# Adaptive random-walk Metropolis for the offset-prior parameters (ϕ, ρ)
+# ---------------------------------------------------------------------------
+
+"""
+    RangeMH(dim; propsd, target)
+
+Random-walk Metropolis state for `θ = (logit ρ, log ϕ)` (or whichever subset is
+being sampled), with Robbins–Monro adaptation of the step size during burn-in.
+
+The original code used a fixed proposal variance, which for these two strongly
+correlated parameters is the difference between a chain that moves and one that
+doesn't.
+"""
+mutable struct RangeMH
+    logstep::Float64
+    naccept::Int
+    ntotal::Int
+    nadapt::Int
+    target::Float64
+end
+
+RangeMH(; propsd::Real = 0.05, target::Real = 0.3) =
+    RangeMH(log(propsd), 0, 0, 0, Float64(target))
+
+acceptrate(mh::RangeMH) = mh.ntotal == 0 ? 0.0 : mh.naccept / mh.ntotal
+
+function adapt!(mh::RangeMH, accepted::Bool)
+    mh.nadapt += 1
+    γ = min(0.5, 5 / mh.nadapt)
+    mh.logstep += γ * ((accepted ? 1.0 : 0.0) - mh.target)
+    return mh
+end
+
+"""
+    sample_range!(ar, arprop, mh, res, CinvRes, Σinv, logdetΣ, priors, sampleρ, sampleϕ, adapting, rng)
+
+Metropolis update of `(ϕ, ρ)` on the `(log ϕ, logit ρ)` scale, targeting the
+`w`-collapsed density.  Returns `(ar, arprop, accepted)`; the two `AR1` objects
+are swapped on acceptance so no factorisation is ever copied.
+"""
+function sample_range!(ar::AR1, arprop::AR1, mh::RangeMH, res, CinvRes,
+                       Σinv::NTuple{3,Float64}, logdetΣ::Float64, priors,
+                       sampleρ::Bool, sampleϕ::Bool, adapting::Bool, rng::AbstractRNG)
+    (sampleρ || sampleϕ) || return (ar, arprop, false)
+
+    step = exp(mh.logstep)
+    lϕ = log(ar.ϕ)
+    lρ = sampleρ ? logit(ar.ρ) : 0.0
+    lϕp = sampleϕ ? lϕ + step * randn(rng) : lϕ
+    lρp = sampleρ ? lρ + step * randn(rng) : lρ
+    ϕp = exp(lϕp)
+    ρp = sampleρ ? logistic(lρp) : ar.ρ
+
+    update!(arprop, ϕp, ρp)
+
+    ll = loglik_offsets(ar, res, CinvRes, Σinv, logdetΣ)
+    llp = loglik_offsets(arprop, res, CinvRes, Σinv, logdetΣ)
+
+    ϕprior = Gamma(priors.ϕ[1], 1 / priors.ϕ[2])
+    lp = logpdf(ϕprior, ar.ϕ)
+    lpp = logpdf(ϕprior, ϕp)
+    if sampleρ
+        ρprior = Normal(priors.ρ[1], priors.ρ[2])   # prior is on the logit scale
+        lp += logpdf(ρprior, lρ)
+        lpp += logpdf(ρprior, lρp)
     end
 
-    function sample_α(y, curref, τ, z, priors)
-        τn = τ[z .+ 1]
-        postprec = priors.α[2] + sum(τn)
-        resid_norm = τn .* (y - curref)
-        postmu = (sum(resid_norm) + priors.α[2]*priors.α[1])/postprec
-        return postmu + sqrt(1/postprec)*randn()
-    end
+    # Jacobian for ϕ only: the ρ prior is already specified on the logit scale.
+    logratio = (llp + lpp + lϕp) - (ll + lp + lϕ)
+    accepted = log(rand(rng)) < logratio
 
-    function sample_τ(y, α, curref, z, priors)
+    mh.ntotal += 1
+    accepted && (mh.naccept += 1)
+    adapting && adapt!(mh, accepted)
 
-        resid² = @. (y - α - curref)^2
+    return accepted ? (arprop, ar, true) : (ar, arprop, false)
+end
 
-        shape₀ = priors.τ₀[1] + 0.5*sum(.!z)
-        rate₀ = priors.τ₀[2] + 0.5*sum(resid²[.!z])
-        τ₀ = rand(Gamma(shape₀, 1 / rate₀))
+# ---------------------------------------------------------------------------
+# Argument handling
+# ---------------------------------------------------------------------------
 
-        shape₁ = priors.τ₁[1] + 0.5*sum(z)
-        rate₁ = priors.τ₁[2] + 0.5*sum(resid²[z])
-        τ₁ = rand(Gamma(shape₁, 1 / rate₁))
+function _require(nt, keys::NTuple{N,Symbol}, what::String) where {N}
+    missing_keys = filter(k -> !haskey(nt, k), keys)
+    isempty(missing_keys) && return nothing
+    throw(ArgumentError("$what is missing required field(s): " *
+                        join(string.(missing_keys), ", ")))
+end
 
-        return [τ₀, τ₁]
-    end
+_residual!(res, h, μ) = (res .= h .- transpose(μ); res)
 
-    function sample_Σ(h, μ, ρ, Qpostchol, priors)
-        res = h .- μ'
-        resS = (1/(1-ρ))*res - (1/(1-ρ))^2 * (Qpostchol \ res)
-        SSE = res' * resS
-        freedom = priors.Σ[1] + size(h,1)
-        scale = Distributions.PDMats.PDMat(Symmetric(priors.Σ[1]*priors.Σ[2] + SSE)) 
-        return rand(InverseWishart(freedom, scale))
-    end
-
-    function sample_μ(h, Qpostchol, ρ, Σ)
-        n = size(h,1)
-        oneSolve = (1/(1-ρ))*ones(n) - (1/(1-ρ))^2 * (Qpostchol \ ones(n))
-        scale = 1/sum(oneSolve)
-        μmu = vec(scale*(oneSolve'*h))
-        return rand(MvNormal(μmu, Symmetric(scale*Σ)))
-    end
-
-    function sample_w!(w, h, μ, ρ, Σ, Qpostchol)   
-        ΣU = cholesky(Σ).U
-        resu = ( (h .- μ') ./ (1- ρ) ) / ΣU
-        wmu = Qpostchol \ resu
-        werror = view(Qpostchol.U \ randn(size(w)), Qpostchol.p, :)
-        w .= (wmu + werror) * ΣU
-    end
-
-    function sample_ρϕ!(nngp, nngpprop, Qpostchol, Qpostpropchol, numnb, loc, ρ, ϕ, h, μ, Σ, propvarc, priors)
-
-        theta = [logit(ρ), log(ϕ)]
-
-        thetaprop = theta + propvarc.L*randn(2)
-
-        ρprop = softmax(thetaprop[1])
-        ϕprop = exp(thetaprop[2])
-
-        getnngp!(nngpprop, loc, ϕprop, numnb)
-
-        Qpostprop = (1/ρprop)*formprec(nngpprop) + (1/(1-ρprop))*I(size(loc,1))
-        cholesky!(Qpostpropchol, Qpostprop)
-
-        res = h .- μ'
-
-        ll = llρϕ(res, Qpostchol, nngp, Σ, ρ)
-        llprop = llρϕ(res, Qpostpropchol, nngpprop, Σ, ρprop)
-
-        ϕpriordist = Gamma(priors.ϕ[1], 1/priors.ϕ[2])
-        ρpriordist = Normal(priors.ρ[1], priors.ρ[2])
-        lprior = logpdf(ϕpriordist, ϕ) + logpdf(ρpriordist, theta[1])
-        lpriorprop = logpdf(ϕpriordist, ϕprop) + logpdf(ρpriordist, thetaprop[1])
-
-        acceptprob = exp(llprop + lpriorprop + thetaprop[2] - ll - lprior - theta[2])
-
-        if rand() < acceptprob
-            ρ, ϕ = ρprop, ϕprop
-            Qpostchol = copy(Qpostpropchol)
-            nngp.B.nzval .= nngpprop.B.nzval
-            nngp.F .= nngpprop.F
+function _fill_tauobs!(τobs, τ, z, mixture::Bool)
+    if mixture
+        t0, t1 = τ[1], τ[2]
+        @inbounds for i in eachindex(τobs)
+            τobs[i] = z[i] ? t1 : t0
         end
+    else
+        fill!(τobs, τ isa Number ? Float64(τ) : Float64(τ[1]))
+    end
+    return τobs
+end
 
-        return ρ, ϕ, Qpostchol
+_sym2inv(Σ) = let d = Σ[1, 1] * Σ[2, 2] - Σ[1, 2] * Σ[2, 1]
+    (Σ[2, 2] / d, -Σ[1, 2] / d, Σ[1, 1] / d)
+end
 
+# ---------------------------------------------------------------------------
+# The sampler
+# ---------------------------------------------------------------------------
+
+"""
+    geolocate(y, t, grid, reference, priors, initial, nsamps; kwargs...)
+
+Infer GEDI geolocation offsets for one contiguous beam collection.
+
+# Model
+
+For footprint `i` at along-track coordinate `t[i]`, with candidate offsets
+`grid` and reference (DEM) values `reference[j, i]` at offset `grid[j, :]`:
+
+```
+y_i    = α + reference[h_i, i] + e_i          e_i ~ N(0, 1/τ)
+h_i    = μ + w_i + ε_i                        ε_i ~ N(0, (1-ρ)Σ)
+cor(w_i, w_j) = exp(-|t_i - t_j| / ϕ)         Var(w_i) = ρΣ
+```
+
+`h_i` is constrained to the grid.  With `mixture = true`, `e_i` is instead a
+two-component normal mixture with weight `πz` on the inflated component, which
+absorbs ground-finding errors.  With `nugget = false`, `ρ ≡ 1` and `h` is itself
+the AR(1) chain.
+
+Because ν = 1/2 Matérn is Markov in 1-D, `K⁻¹` is tridiagonal and the entire
+prior apparatus — factorisation, log-determinant, solves, and the `w` draw — is
+`O(n)` per sweep.
+
+# Arguments
+
+* `y` — `n` observed elevations.
+* `t` — `n` strictly increasing along-track coordinates (distance or time).
+* `grid` — `k × 2` candidate offsets, or an [`OffsetGrid`](@ref).
+* `reference` — `k × n` reference values.  May be `Float32`; that halves the
+  memory traffic of the dominant loop.
+* `priors` — `NamedTuple` with `α = (mean, precision)`, `Σ = (ν₀, Ψ)`,
+  `ϕ = (shape, rate)`; `τ = (shape, rate)` or, for `mixture = true`,
+  `τ₀`, `τ₁` and `πz = (a, b)`; and `ρ = (mean, sd)` on the **logit** scale.
+* `initial` — `NamedTuple` with at least `Σ, α, ϕ, μ, τ`; optionally
+  `ρ, w, h, z, πz`.
+* `nsamps` — number of draws to *store*.
+
+# Keywords
+
+* `mixture = false` — two-component observation error.
+* `nugget = true` — include `ε_i`; `false` fixes `ρ = 1`.
+* `sampleϕ = true`, `sampleρ = true` — update the prior parameters.
+* `burn = 0`, `thin = 1` — `burn + nsamps*thin` sweeps are run.
+* `window = Inf` — see the note below.
+* `nchunks = Threads.nthreads()` — parallel chunks for the offset update.
+* `propsd = 0.05`, `adapt = true` — Metropolis step size and its adaptation.
+* `store_h = true`, `store_w = true` — the offset indices are always returned;
+  these control the much larger coordinate arrays.
+* `rng`, `progress`.
+
+# The `window` keyword
+
+Setting `window = w` restricts each footprint's categorical draw to the lattice
+cells within `w` prior standard deviations of that footprint's prior mean, which
+cuts the dominant loop by the ratio of the window area to the grid area.
+
+This is an **approximation**: it renormalises the conditional over the window
+instead of the full grid.  The dropped cells have negligible *prior* mass, but
+the reference likelihood can be sharp enough to favour a far cell, so a jump the
+exact sampler would make can be suppressed.  `w = 6` is a reasonable starting
+point; compare against `window = Inf` on a subset before relying on it.
+
+# Sweep order
+
+`h → α → τ → (z, πz) → Σ → μ → (ϕ, ρ) → w`.
+
+The `Σ`, `μ` and `(ϕ, ρ)` updates all target densities with `w` integrated out,
+so `w` **must** be redrawn after them and before it is used again.  (Drawing `w`
+before the `(ϕ, ρ)` update, as an earlier version did, leaves the chain with the
+wrong stationary distribution.)
+
+# Returns
+
+A `NamedTuple` of draws: `hidx` (`n × nsamps` grid indices), `h`, `w`, `α`, `τ`,
+`z`, `πz`, `Σ`, `μ`, `ρ`, `ϕ`, and `accept` (the Metropolis acceptance rate).
+"""
+function geolocate(y::AbstractVector, t::AbstractVecOrMat, grid,
+                   reference::AbstractMatrix, priors, initial, nsamps::Integer;
+                   mixture::Bool = false,
+                   nugget::Bool = true,
+                   sampleϕ::Bool = true,
+                   sampleρ::Bool = true,
+                   burn::Integer = 0,
+                   thin::Integer = 1,
+                   window::Real = Inf,
+                   nchunks::Integer = Threads.nthreads(),
+                   propsd::Real = 0.05,
+                   adapt::Bool = true,
+                   store_h::Bool = true,
+                   store_w::Bool = true,
+                   progress::Bool = true,
+                   rng::AbstractRNG = Random.default_rng())
+
+    g = OffsetGrid(grid)
+    n, k = length(y), length(g)
+    size(reference) == (k, n) || throw(DimensionMismatch(
+        "reference must be $(k) × $(n) (grid points × footprints), got $(size(reference))"))
+    length(t) == n || throw(DimensionMismatch("t must have length $(n), got $(length(t))"))
+    nsamps ≥ 1 || throw(ArgumentError("nsamps must be positive"))
+    thin ≥ 1 || throw(ArgumentError("thin must be positive"))
+
+    _require(priors, (:α, :Σ, :ϕ), "priors")
+    _require(initial, (:Σ, :α, :ϕ, :μ, :τ), "initial")
+    if mixture
+        _require(priors, (:τ₀, :τ₁, :πz), "priors (mixture = true)")
+    else
+        _require(priors, (:τ,), "priors")
+    end
+    sampleρ = sampleρ && nugget
+    nugget && sampleρ && _require(priors, (:ρ,), "priors (sampleρ = true)")
+
+    # --- state ---
+    ρ0 = nugget ? Float64(get(initial, :ρ, 0.95)) : 1.0
+    nugget && (0 < ρ0 < 1 || throw(ArgumentError("initial.ρ must lie in (0,1) when nugget = true")))
+    ar = AR1(Float64.(vec(t)); phi = Float64(initial.ϕ), rho = ρ0)
+    arprop = AR1(Float64.(vec(t)); phi = Float64(initial.ϕ), rho = ρ0)
+
+    α = Float64(initial.α)
+    μ = Float64[initial.μ[1], initial.μ[2]]
+    Σ = Matrix{Float64}(initial.Σ)
+    τ = mixture ? Float64[initial.τ[1], initial.τ[2]] : Float64[initial.τ isa Number ? initial.τ : initial.τ[1]]
+    πz = Float64(get(initial, :πz, 0.05))
+    z = BitVector(undef, n)
+    if mixture && haskey(initial, :z)
+        z .= initial.z
+    else
+        fill!(z, false)
     end
 
-    function sample_z(y, α, curref, τ, πz)
+    w = zeros(Float64, n, 2)
+    haskey(initial, :w) && copyto!(w, initial.w)
 
-        resid² = @. (y - α - curref)^2
-        ll0 = @. -0.5 * ( τ[1] * resid² - log(τ[1]) ) + log(1 - πz)
-        ll1 = @. -0.5 * ( τ[2] * resid² - log(τ[2]) ) + log(πz)
-
-        maxll = max.(ll0, ll1)
-
-        ll0 .-= maxll
-        ll1 .-= maxll
-
-        πz_post = @. exp(ll1) / (exp(ll1) + exp(ll0))
-        
-        return BitVector([rand(Bernoulli(p)) for p in πz_post])
-
+    h = zeros(Float64, n, 2)
+    hidx = Vector{Int32}(undef, n)
+    if haskey(initial, :h)
+        @inbounds for i in 1:n
+            hidx[i] = nearestindex(g, initial.h[i, 1], initial.h[i, 2])
+        end
+    else
+        fill!(hidx, Int32(centerindex(g)))
+    end
+    curref = Vector{Float64}(undef, n)
+    @inbounds for i in 1:n
+        h[i, 1] = g.coords[hidx[i], 1]
+        h[i, 2] = g.coords[hidx[i], 2]
+        curref[i] = reference[hidx[i], i]
     end
 
-    function sample_πz(z, priors)
+    ws = OffsetWorkspace(k, n; nchunks = nchunks, rng = rng)
+    _fill_tauobs!(ws.τobs, τ, z, mixture)
+    mh = RangeMH(; propsd = propsd)
 
-        sumz = sum(z)
-        απz_post = priors.πz[1] + sumz
-        βπz_post = priors.πz[2] + length(z) - sumz
+    res = zeros(Float64, n, 2)
+    CinvRes = zeros(Float64, n, 2)
+    Z = zeros(Float64, n, 2)
 
-        return rand(Beta(απz_post, βπz_post))
+    # --- storage ---
+    M = Int(nsamps)
+    hidxs = Matrix{Int32}(undef, n, M)
+    hs = store_h ? Array{Float64}(undef, n, 2, M) : nothing
+    wsamp = (store_w && nugget) ? Array{Float64}(undef, n, 2, M) : nothing
+    αs = Vector{Float64}(undef, M)
+    τs = mixture ? Matrix{Float64}(undef, 2, M) : Matrix{Float64}(undef, 1, M)
+    zs = mixture ? BitMatrix(undef, n, M) : nothing
+    πzs = mixture ? Vector{Float64}(undef, M) : nothing
+    Σs = Array{Float64}(undef, 2, 2, M)
+    μs = Matrix{Float64}(undef, 2, M)
+    ρs = Vector{Float64}(undef, M)
+    ϕs = Vector{Float64}(undef, M)
 
-    end
-    
-    
+    win = Float64(window)
+    total = Int(burn) + M * Int(thin)
+    iter = progress ? ProgressBar(1:total) : 1:total
 
-    ##########################
-
-
-
-    n = length(y)
-    k = size(grid,1)
-
-    # Open up sample memory and get initial values
-
-    hsamps = zeros(n, 2, nsamps)
-    h = zeros(n,2)
-
-    wsamps = zeros(n, 2, nsamps)
-    w = copy(initial.w)
-    wsamps[:,:,1] .= initial.w
-
-    Σsamps = zeros(2, 2, nsamps)
-    Σ = copy(initial.Σ)
-    Σsamps[:,:,1] .= Σ
-
-    ρsamps = zeros(nsamps)
-    ρ = initial.ρ
-    ρsamps[1] = ρ
-
-    ϕsamps = zeros(nsamps)
-    ϕ = initial.ϕ
-    ϕsamps[1] = ϕ
-
-    μsamps = zeros(2, nsamps)
-    μ = copy(initial.μ)
-    μsamps[:,1] .= μ
-
-    αsamps = zeros(nsamps)
-    α = initial.α
-    αsamps[1] = α
-
-    τsamps = zeros(2, nsamps)
-    τ = copy(initial.τ)
-    τsamps[:,1] .= τ
-
-    zsamps = BitMatrix(undef, n, nsamps)
-    z = BitVector(initial.z)
-    zsamps[:,1] .= z
-
-    πzsamps = zeros(nsamps)
-    πz = initial.πz
-    πzsamps[1] = πz
-
-    gridcenterind = argmin(sum(grid.^2, dims = 2)[:,1])
-    curref = reference[CartesianIndex.(fill(gridcenterind, n), 1:n)]
-
-    # Initialize important mats and decomps
-
-    nngp = getnngp(loc, ϕ, numnb)
-    nngpprop = copy(nngp)
-    Qpost = (1/ρ)*formprec(nngp) + (1/(1-ρ))*I(n)
-    Qpostchol = cholesky(Qpost)
-    Qpostpropchol = copy(Qpostchol)
-
-    if size(propvar,1) == 1
-        propvar = propvar*I(2)
-    end
-
-    propvarc = cholesky(Symmetric(propvar))
-
-    gridu = copy(grid)
-    meanu = copy(w)
-    loglike = copy(reference)
-
-    ##########################################
-    # Begin sampling
-    ##########################################
-
-    iter = ProgressBar(1:nsamps)
-
+    # --- sweep ---
     for m in iter
+        sample_offsets!(hidx, h, curref, ws, g, reference, y, α, μ, w, Σ, ar; window = win)
 
-        sample_h!(h, loglike, meanu, gridu, grid, y, curref, α, reference, τ, z, μ, w, ρ, Σ)
+        α = sample_alpha(y, curref, ws.τobs, priors.α, rng)
 
-        α = sample_α(y, curref, τ, z, priors)
+        if mixture
+            sample_tau_mixture!(τ, y, α, curref, z, priors.τ₀, priors.τ₁, rng)
+            sample_z!(z, y, α, curref, τ, πz, rng)
+            πz = sample_pi(z, priors.πz, rng)
+        else
+            τ[1] = sample_tau(y, α, curref, priors.τ, rng)
+        end
+        _fill_tauobs!(ws.τobs, τ, z, mixture)
 
-        τ .= sample_τ(y, α, curref, z, priors)
+        _residual!(res, h, μ)
+        Σ = sample_Sigma(ar, res, CinvRes, priors.Σ, rng)
 
-        z .= sample_z(y, α, curref, τ, πz)
+        sample_mu!(μ, h, ar, Σ, rng)
+        _residual!(res, h, μ)
 
-        πz = sample_πz(z, priors)
+        Σinv = _sym2inv(Σ)
+        logdetΣ = log(Σ[1, 1] * Σ[2, 2] - Σ[1, 2] * Σ[2, 1])
+        ar, arprop, _ = sample_range!(ar, arprop, mh, res, CinvRes, Σinv, logdetΣ,
+                                      priors, sampleρ, sampleϕ, adapt && m ≤ burn, rng)
 
-        Σ .= sample_Σ(h, μ, ρ, Qpostchol, priors)
+        # w is redrawn last: every update above is collapsed over it.
+        ΣU = cholesky(Symmetric(Σ)).U
+        sample_w!(w, ar, res, ΣU, Z, rng)
 
-        μ .= sample_μ(h, Qpostchol, ρ, Σ)
-
-        sample_w!(w, h, μ, ρ, Σ, Qpostchol)
-
-        ρ, ϕ, Qpostchol = sample_ρϕ!(nngp, nngpprop, Qpostchol, Qpostpropchol, numnb, loc, ρ, ϕ, h, μ, Σ, propvarc, priors)
-
-        ######
-
-        hsamps[:,:,m] .= h
-        αsamps[m] = α
-        τsamps[:,m] .= τ
-        zsamps[:,m] .= z
-        πzsamps[m] = πz
-        Σsamps[:,:,m] .= Σ
-        μsamps[:,m] .= μ
-        wsamps[:,:,m] .= w
-        ρsamps[m] = ρ
-        ϕsamps[m] = ϕ
-
-
+        if m > burn && (m - burn) % thin == 0
+            s = (m - burn) ÷ thin
+            @inbounds hidxs[:, s] .= hidx
+            store_h && (@inbounds hs[:, :, s] .= h)
+            wsamp !== nothing && (@inbounds wsamp[:, :, s] .= w)
+            αs[s] = α
+            τs[1, s] = τ[1]
+            if mixture
+                τs[2, s] = τ[2]
+                @inbounds zs[:, s] .= z
+                πzs[s] = πz
+            end
+            @inbounds Σs[:, :, s] .= Σ
+            @inbounds μs[:, s] .= μ
+            ρs[s] = ar.ρ
+            ϕs[s] = ar.ϕ
+        end
     end
 
-    return (h = hsamps, α = αsamps, τ = τsamps, z = zsamps, Σ = Σsamps, μ = μsamps, w = wsamps, ρ = ρsamps, ϕ = ϕsamps, πz = πzsamps)
+    return (hidx = hidxs,
+            h = hs,
+            w = wsamp,
+            α = αs,
+            τ = mixture ? τs : vec(τs),
+            z = zs,
+            πz = πzs,
+            Σ = Σs,
+            μ = μs,
+            ρ = ρs,
+            ϕ = ϕs,
+            grid = g,
+            accept = acceptrate(mh))
+end
 
+"""
+    offsets(samples, i)
+
+The `2 × nsamps` matrix of offset draws for footprint `i`, reconstructed from
+the stored grid indices.  Useful when `store_h = false` keeps the full
+coordinate array out of memory.
+"""
+function offsets(samples, i::Integer)
+    g = samples.grid
+    idx = view(samples.hidx, i, :)
+    out = Matrix{Float64}(undef, 2, length(idx))
+    @inbounds for m in eachindex(idx)
+        out[1, m] = g.coords[idx[m], 1]
+        out[2, m] = g.coords[idx[m], 2]
+    end
+    return out
+end
+
+"""
+    posteriormean(samples)
+
+`n × 2` posterior mean offset per footprint, computed from the stored indices.
+"""
+function posteriormean(samples)
+    g = samples.grid
+    idx = samples.hidx
+    n, M = size(idx)
+    out = zeros(Float64, n, 2)
+    @inbounds for m in 1:M, i in 1:n
+        out[i, 1] += g.coords[idx[i, m], 1]
+        out[i, 2] += g.coords[idx[i, m], 2]
+    end
+    return out ./ M
 end
